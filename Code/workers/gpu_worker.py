@@ -1,6 +1,6 @@
 import time
-from Code.llm.inference import run_llm
-from Code.rag.retriever import retrieve_context
+from ..llm.inference import run_llm
+from ..rag.retriever import retrieve_context
 
 class GPUWorker:
     def __init__(self, id):

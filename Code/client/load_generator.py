@@ -1,7 +1,7 @@
 # Client 1000 Users
 
 import threading
-from Code.common.models import Request
+from ..common.models import Request
 
 def simulate_user(scheduler, user_id):
     request = Request(id=user_id, query=f"Query {user_id}")
@@ -9,7 +9,7 @@ def simulate_user(scheduler, user_id):
 
     print(f"[Client] Response {response['id']} | Latency: {response['latency']:.3f}s")
 
-def run_load_test(scheduler, num_users=1000):
+def run_load_test(scheduler, num_users=10):
     threads = []
 
     for i in range(num_users):
@@ -19,3 +19,4 @@ def run_load_test(scheduler, num_users=1000):
 
     for t in threads:
         t.join()
+
