@@ -1,0 +1,26 @@
+import time
+from Code.llm.inference import run_llm
+from Code.rag.retriever import retrieve_context
+
+class GPUWorker:
+    def __init__(self, id):
+        self.id = id
+
+    def process(self, request):
+        start = time.time()
+        
+        print(f"[Worker {self.id}] Processing request {request.id}")
+        
+        # Rag Step
+        context = retrieve_context(request.query)
+
+        # LLM Step
+        result = run_llm(request.query, context)
+
+        latency = time.time() - start
+
+        return {
+            "id": request.id,
+            "result": result,
+            "latency": latency
+            }
