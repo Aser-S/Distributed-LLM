@@ -15,14 +15,17 @@ class GPUWorker:
     SIM_LATENCY_MIN = 0.05
     SIM_LATENCY_MAX = 0.20
 
-    def __init__(self, worker_id: int):
+    DEFAULT_CONCURRENCY = 4
+
+    def __init__(self, worker_id: int, concurrency: int = DEFAULT_CONCURRENCY):
         self.id = worker_id
-        self.inflight = 0          # number of requests currently being processed
+        self.concurrency = max(1, concurrency)        # max parallel requests on this worker
+        self.inflight = 0                              # number of requests currently being processed
         self.processed_count = 0
         self.total_latency = 0.0
         self._lock = threading.Lock()
-        self._queue: asyncio.Queue | None = None     # created in start()
-        self._loop_task: asyncio.Task | None = None  # the drain loop
+        self._queue: asyncio.Queue | None = None       # created in start()
+        self._consumers: list[asyncio.Task] = []       # N drain coroutines
 
     @property
     def busy(self) -> bool:
@@ -83,22 +86,27 @@ class GPUWorker:
     # --- Step 8: per-worker async queue ---
 
     def start(self) -> None:
-        """Start the drain loop. Must be called from inside a running event loop."""
-        if self._loop_task is not None:
+        """Spawn `concurrency` consumer coroutines sharing one queue.
+
+        Must be called from inside a running event loop.
+        """
+        if self._consumers:
             return
         self._queue = asyncio.Queue()
-        self._loop_task = asyncio.create_task(
-            self._run_loop(), name=f"worker-{self.id}-loop"
-        )
+        self._consumers = [
+            asyncio.create_task(self._consumer(), name=f"worker-{self.id}-c{i}")
+            for i in range(self.concurrency)
+        ]
 
     async def stop(self) -> None:
-        """Send shutdown sentinel and wait for the drain loop to exit cleanly."""
-        if self._queue is None:
+        """Send one shutdown sentinel per consumer and wait for all to exit."""
+        if not self._consumers or self._queue is None:
             return
-        await self._queue.put(None)
-        await self._loop_task
+        for _ in self._consumers:
+            await self._queue.put(None)
+        await asyncio.gather(*self._consumers)
+        self._consumers = []
         self._queue = None
-        self._loop_task = None
 
     async def submit(self, request) -> dict:
         """Enqueue a request and await its response."""
@@ -108,11 +116,10 @@ class GPUWorker:
         await self._queue.put((request, future))
         return await future
 
-    async def _run_loop(self) -> None:
-        """Drain loop: pulls requests off the queue and processes them serially.
-
-        Step 9 lifts this from serial to "up to N concurrent" with a small change.
-        """
+    async def _consumer(self) -> None:
+        """One of N consumers. Pulls items off the shared queue until the sentinel."""
+        if self._queue is None:
+            return
         while True:
             item = await self._queue.get()
             if item is None:                # shutdown sentinel
