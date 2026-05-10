@@ -1,20 +1,19 @@
-"""GPU worker node - Phase 2 / Step 7: async task surface via asyncio.to_thread.
+"""GPU worker node - Phase 3 / Step 11: real RAG retrieval in `_do_work`.
 
-`process()` is the original sync lifecycle (used by round-robin LB).
-`process_async()` adds an async surface that offloads `_do_work` to a thread,
-keeping the event loop free for many concurrent in-flight requests.
+`process()` is the sync lifecycle (used by round-robin LB).
+`process_async()` adds an async surface that offloads `_do_work` to a thread.
+`_do_work` now calls the restored `retrieve_context` from rag/retriever.py.
+Step 12 will wrap this call in the full `infer()` pipeline (Ollama LLM).
 """
 
 import asyncio
-import random
 import time
 import threading
 
+from rag.retriever import retrieve_context
+
 
 class GPUWorker:
-    SIM_LATENCY_MIN = 0.05
-    SIM_LATENCY_MAX = 0.20
-
     DEFAULT_CONCURRENCY = 4
 
     def __init__(self, worker_id: int, concurrency: int = DEFAULT_CONCURRENCY):
@@ -60,10 +59,13 @@ class GPUWorker:
             self._release(time.time() - start)
 
     def _do_work(self, request) -> str:
-        """Stubbed GPU computation. Phase 3 replaces this with the real LLM call."""
-        delay = random.uniform(self.SIM_LATENCY_MIN, self.SIM_LATENCY_MAX)
-        time.sleep(delay)
-        return f"[stub] worker={self.id} answered query={request.query!r}"
+        """Step 11: retrieve context from the RAG knowledge base.
+
+        Step 12 will wrap this in the full `infer()` pipeline so the LLM gets
+        the retrieved context as part of its prompt.
+        """
+        context = retrieve_context(request.query)
+        return f"[rag] worker={self.id} ctx_chars={len(context)} :: {context[:120]!r}"
 
     def _claim(self) -> None:
         with self._lock:
