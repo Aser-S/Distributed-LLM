@@ -1,16 +1,17 @@
-"""GPU worker node - Phase 3 / Step 11: real RAG retrieval in `_do_work`.
+"""GPU worker node - Phase 3 / Step 12: real LLM pipeline in `_do_work`.
 
 `process()` is the sync lifecycle (used by round-robin LB).
 `process_async()` adds an async surface that offloads `_do_work` to a thread.
-`_do_work` now calls the restored `retrieve_context` from rag/retriever.py.
-Step 12 will wrap this call in the full `infer()` pipeline (Ollama LLM).
+`_do_work` calls `llm.inference.infer(query)`, which internally retrieves RAG
+context and forwards the full prompt to Ollama. The TA's "use AI model, no
+simulation" requirement is satisfied here.
 """
 
 import asyncio
 import time
 import threading
 
-from rag.retriever import retrieve_context
+from llm.inference import infer
 
 
 class GPUWorker:
@@ -59,13 +60,17 @@ class GPUWorker:
             self._release(time.time() - start)
 
     def _do_work(self, request) -> str:
-        """Step 11: retrieve context from the RAG knowledge base.
+        """Step 12: full RAG + LLM pipeline via `infer()`.
 
-        Step 12 will wrap this in the full `infer()` pipeline so the LLM gets
-        the retrieved context as part of its prompt.
+        `infer()` is the coworkers' module-level entry point: it retrieves
+        context from rag/retriever.py and forwards the augmented prompt to
+        Ollama on llama3.2:1b. Returns the LLM's response text directly, or
+        a tagged error string if Ollama is unreachable / errors out.
         """
-        context = retrieve_context(request.query)
-        return f"[rag] worker={self.id} ctx_chars={len(context)} :: {context[:120]!r}"
+        result = infer(request.query)
+        if result.get("status") != "success":
+            return f"[infer-error] {result.get('error', 'unknown')}: {result.get('response', '')[:200]}"
+        return result["response"]
 
     def _claim(self) -> None:
         with self._lock:
