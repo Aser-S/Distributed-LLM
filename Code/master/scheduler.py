@@ -50,3 +50,30 @@ class Scheduler:
             raise RuntimeError("[Scheduler] no workers registered")
         print(f"[Scheduler] dispatching request {request.id} (workers={len(self.workers)})")
         return self.lb.dispatch(request)
+
+    def cluster_status(self) -> dict:
+        """Snapshot of the cluster: per-worker stats + aggregates.
+
+        Used to verify load distribution and to feed monitoring in Phase 5.
+        """
+        workers = self.get_workers()
+        per_worker = []
+        total_processed = 0
+        total_latency = 0.0
+        for w in workers:
+            avg = (w.total_latency / w.processed_count) if w.processed_count else 0.0
+            per_worker.append({
+                "worker_id": w.id,
+                "processed": w.processed_count,
+                "busy": w.busy,
+                "avg_latency": round(avg, 4),
+            })
+            total_processed += w.processed_count
+            total_latency += w.total_latency
+        cluster_avg = (total_latency / total_processed) if total_processed else 0.0
+        return {
+            "worker_count": len(workers),
+            "total_processed": total_processed,
+            "cluster_avg_latency": round(cluster_avg, 4),
+            "workers": per_worker,
+        }
