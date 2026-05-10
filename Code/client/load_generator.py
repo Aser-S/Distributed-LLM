@@ -1,7 +1,7 @@
 # Client 1000 Users
 
 import threading
-from ..common.models import Request
+from common.models import Request
 
 def simulate_user(scheduler, user_id):
     request = Request(id=user_id, query=f"Query {user_id}")
