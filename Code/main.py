@@ -12,12 +12,14 @@ from client.load_generator import run_load_test
 
 
 def main():
-    # Phase 1 default: 4 simulated GPU workers, 20-user smoke test.
-    # Phase 2 will lift the user count once async + queues exist.
+    # Phase 3 default: 4 GPU workers, 4-user sync smoke test.
+    # Each request now hits real Ollama (~3-5 s); 4 users via threading + RR
+    # gives one request per worker. For the async pipeline + bigger loads,
+    # use the Step 13 async demo instead.
     workers = [GPUWorker(i) for i in range(4)]
     scheduler = Scheduler(workers)
 
-    run_load_test(scheduler, num_users=20)
+    run_load_test(scheduler, num_users=4)
 
     print("\n--- CLUSTER STATUS ---")
     status = scheduler.cluster_status()
