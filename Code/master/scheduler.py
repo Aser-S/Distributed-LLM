@@ -1,11 +1,15 @@
-"""Master scheduler - Phase 2 / Step 10: pluggable balancing strategy.
+"""Master scheduler - Phase 3 / Step 13: sync + async dispatch.
 
-The Scheduler owns the worker registry AND a load balancer. Strategies:
-  - "round_robin"        -> existing lb.load_balancer.LoadBalancer (cycles workers)
+Strategies for `get_next_worker`:
+  - "round_robin"        -> lb.load_balancer.LoadBalancer (cycles workers)
   - "least_connections"  -> LeastConnectionsBalancer below (picks lowest inflight)
 
-Whenever the registry changes the balancer is rebuilt with the current workers.
+Execution surfaces:
+  - handle_request(request)        -> sync, calls worker.process(request)
+  - handle_request_async(request)  -> async, calls await worker.submit(request)
 """
+
+import asyncio
 
 from lb.load_balancer import LoadBalancer
 from workers.gpu_worker import GPUWorker
@@ -81,11 +85,40 @@ class Scheduler:
             raise ValueError(f"unknown strategy {self.strategy!r}")
 
     def handle_request(self, request):
-        """Dispatch a request to a worker via the LoadBalancer (round robin)."""
+        """Sync dispatch via the LoadBalancer. Calls worker.process() (blocking)."""
         if not self.lb:
             raise RuntimeError("[Scheduler] no workers registered")
         print(f"[Scheduler] dispatching request {request.id} (workers={len(self.workers)})")
         return self.lb.dispatch(request)
+
+    # --- Step 13: async dispatch via worker queues ---
+
+    def start_workers(self) -> None:
+        """Spawn the drain loop on every registered worker.
+
+        Must be called from inside a running event loop (asyncio.Queue and
+        create_task both require one). Idempotent: re-calling is a no-op.
+        """
+        for w in self.workers.values():
+            w.start()
+
+    async def stop_workers(self) -> None:
+        """Send shutdown sentinels and wait for all worker drain loops to exit."""
+        if not self.workers:
+            return
+        await asyncio.gather(*(w.stop() for w in self.workers.values()))
+
+    async def handle_request_async(self, request) -> dict:
+        """Async dispatch: LB picks the worker, the worker's queue runs the request.
+
+        The LB's selection logic (RR or least-connections) is reused unchanged;
+        only the execution surface differs (await submit vs sync process).
+        """
+        if not self.lb:
+            raise RuntimeError("[Scheduler] no workers registered")
+        worker = self.lb.get_next_worker()
+        print(f"[Scheduler] dispatching request {request.id} -> worker {worker.id} (async)")
+        return await worker.submit(request)
 
     def cluster_status(self) -> dict:
         """Snapshot of the cluster: per-worker stats + aggregates.
