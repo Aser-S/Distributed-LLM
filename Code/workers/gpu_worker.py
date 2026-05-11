@@ -21,6 +21,7 @@ import threading
 from collections import deque
 
 from llm.inference import infer
+from common.gpu_sim import GPUSimulator
 
 
 class GPUWorker:
@@ -41,7 +42,11 @@ class GPUWorker:
         self._heartbeat_task: asyncio.Task | None = None
         self._dead = False                             # Step 18: kill switch
         self.pending = 0                               # Step 19: dispatched-but-not-yet-completed
-        self.recent: deque[tuple[float, float]] = deque(maxlen=self.METRICS_WINDOW)  # Step 20
+        self.recent: deque[tuple[float, float]] = deque(maxlen=self.METRICS_WINDOW)  # Step 20 (service time)
+        self.queue_wait: deque[tuple[float, float]] = deque(maxlen=self.METRICS_WINDOW)
+        self.end_to_end: deque[tuple[float, float]] = deque(maxlen=self.METRICS_WINDOW)
+        # Phase 23: GPU simulation
+        self.gpu_sim = GPUSimulator(worker_id, concurrency)
 
     @property
     def busy(self) -> bool:
@@ -104,6 +109,13 @@ class GPUWorker:
             self.total_latency += elapsed
             # Step 20: append a sliding-window sample for p50/p95/throughput.
             self.recent.append((time.time(), elapsed))
+
+    def _record_queue_wait(self, wait_s: float, end_to_end_s: float | None = None) -> None:
+        with self._lock:
+            now = time.time()
+            self.queue_wait.append((now, wait_s))
+            if end_to_end_s is not None:
+                self.end_to_end.append((now, end_to_end_s))
 
     def _build_response(self, request, result: str, latency: float) -> dict:
         return {
@@ -174,11 +186,16 @@ class GPUWorker:
               f"new work will raise WorkerDeadError")
 
     async def _heartbeat_loop(self) -> None:
-        """Tick `last_heartbeat` every HEARTBEAT_INTERVAL seconds until cancelled."""
+        """Tick `last_heartbeat` every HEARTBEAT_INTERVAL seconds until cancelled.
+        Also update simulated GPU state.
+        """
         try:
             while True:
                 await asyncio.sleep(self.HEARTBEAT_INTERVAL)
                 self.last_heartbeat = time.time()
+                # Phase 23: update GPU sim state based on current load
+                queue_depth = self._queue.qsize() if self._queue is not None else 0
+                self.gpu_sim.update(self.inflight, queue_depth)
         except asyncio.CancelledError:
             return
 
@@ -187,7 +204,7 @@ class GPUWorker:
         if self._queue is None:
             raise RuntimeError(f"Worker {self.id}: call start() before submit()")
         future = asyncio.get_running_loop().create_future()
-        await self._queue.put((request, future))
+        await self._queue.put((request, future, time.time()))
         return await future
 
     async def _consumer(self) -> None:
@@ -199,9 +216,14 @@ class GPUWorker:
             if item is None:                # shutdown sentinel
                 self._queue.task_done()
                 return
-            request, future = item
+            request, future, enqueued_at = item
+            queue_wait = max(0.0, time.time() - enqueued_at)
             try:
                 result = await self.process_async(request)
+                if isinstance(result, dict):
+                    latency = result.get("latency")
+                    if isinstance(latency, (int, float)):
+                        self._record_queue_wait(queue_wait, queue_wait + float(latency))
                 # Guard: the future may already be cancelled if the caller
                 # gave up on us (Step 16 wait_for timeout) — setting a result
                 # on a settled future raises InvalidStateError.

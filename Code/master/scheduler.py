@@ -26,11 +26,15 @@ Step 21: optional dashboard loop (`start_dashboard()` / `stop_dashboard()`)
 """
 
 import asyncio
-import math
 import time
+import threading
+from dataclasses import dataclass, field
+from collections import deque
 
 from lb.load_balancer import LoadBalancer
 from workers.gpu_worker import GPUWorker
+from common.metrics import percentiles as _calc_percentiles
+from common.structured_logging import get_logger
 
 
 class LeastConnectionsBalancer:
@@ -71,10 +75,31 @@ class LoadAwareBalancer:
         return self.get_next_worker().process(request)
 
 
+class GPUAwareBalancer:
+    """Phase 23: picks worker with lowest saturation score (simulated GPU pressure).
+
+    Considers saturation_score from GPU simulator: combines GPU util + queue pressure.
+    Falls back to pending count for ties.
+    """
+
+    def __init__(self, workers: list[GPUWorker]):
+        self.workers = workers
+
+    def get_next_worker(self) -> GPUWorker:
+        # Primary key: saturation score; secondary: pending count; tertiary: id.
+        return min(
+            self.workers,
+            key=lambda w: (w.gpu_sim.util_pct / 100.0, w.pending, w.id),
+        )
+
+    def dispatch(self, request):
+        return self.get_next_worker().process(request)
+
+
 class Scheduler:
     """Master controller. Source of truth for the cluster; dispatches via LB."""
 
-    SUPPORTED_STRATEGIES = ("round_robin", "least_connections", "load_aware")
+    SUPPORTED_STRATEGIES = ("round_robin", "least_connections", "load_aware", "gpu_aware")
 
     # Health-check tuning knobs.
     HEALTH_CHECK_INTERVAL = 2.0   # seconds between health sweeps
@@ -100,8 +125,45 @@ class Scheduler:
         self.lb = None
         self._health_monitor_task: asyncio.Task | None = None
         self._dashboard_task: asyncio.Task | None = None
+        self._metrics_lock = threading.Lock()
+        self.metrics = SchedulerMetrics()
         if workers:
             self.register_workers(workers)
+
+    def _record_completion(self) -> None:
+        with self._metrics_lock:
+            self.metrics.completed.append(time.time())
+
+    def _record_retry(self) -> None:
+        with self._metrics_lock:
+            self.metrics.retries += 1
+
+    def _record_timeout(self) -> None:
+        with self._metrics_lock:
+            self.metrics.timeouts += 1
+
+    def _record_failure(self) -> None:
+        with self._metrics_lock:
+            self.metrics.failures += 1
+
+    def _record_overload(self) -> None:
+        with self._metrics_lock:
+            self.metrics.overload_events += 1
+
+    def _scheduler_metrics_snapshot(self, now: float) -> tuple[int, float, int, int, int, int]:
+        with self._metrics_lock:
+            recent = sum(
+                1 for ts in self.metrics.completed if now - ts <= self.THROUGHPUT_WINDOW
+            )
+            tput = recent / self.THROUGHPUT_WINDOW
+            return (
+                len(self.metrics.completed),
+                tput,
+                self.metrics.retries,
+                self.metrics.timeouts,
+                self.metrics.failures,
+                self.metrics.overload_events,
+            )
 
     def register_worker(self, worker):
         if worker.id in self.workers:
@@ -138,6 +200,8 @@ class Scheduler:
             self.lb = LeastConnectionsBalancer(workers)
         elif self.strategy == "load_aware":
             self.lb = LoadAwareBalancer(workers)
+        elif self.strategy == "gpu_aware":
+            self.lb = GPUAwareBalancer(workers)
         else:
             raise ValueError(f"unknown strategy {self.strategy!r}")
 
@@ -221,7 +285,10 @@ class Scheduler:
 
         Format keeps everything on one line so a tail -f / scrolling terminal
         stays readable. Per-worker block uses `id:processed@p95s/tput` triples.
+
+        Phase 21: also emit a cluster snapshot event for structured logging.
         """
+        logger = get_logger()
         try:
             while True:
                 await asyncio.sleep(interval)
@@ -238,6 +305,17 @@ class Scheduler:
                     f"avg={status['cluster_avg_latency']}s "
                     f"tput={status['cluster_throughput_rps']}rps | {workers}"
                 )
+                # Phase 21: emit cluster snapshot for structured logging
+                logger.cluster_snapshot(
+                    status["strategy"],
+                    status["worker_count"],
+                    status["total_processed"],
+                    status["cluster_avg_latency"],
+                    status["cluster_throughput_rps"],
+                    status["cluster_gpu_util_avg_pct"],
+                    status["retry_rate"],
+                    status["timeout_rate"],
+                )
         except asyncio.CancelledError:
             return
 
@@ -248,6 +326,7 @@ class Scheduler:
         exceeds STALE_THRESHOLD. Eviction calls unregister_worker(), which
         also rebuilds the LB so no future requests land on the dead worker.
         """
+        logger = get_logger()
         try:
             while True:
                 await asyncio.sleep(self.HEALTH_CHECK_INTERVAL)
@@ -257,9 +336,11 @@ class Scheduler:
                     if now - w.last_heartbeat > self.STALE_THRESHOLD
                 ]
                 for wid in stale:
+                    age = now - self.workers[wid].last_heartbeat
+                    logger.evict_worker(wid, "stale_heartbeat")
                     print(
                         f"[Scheduler] worker {wid} heartbeat stale "
-                        f"({now - self.workers[wid].last_heartbeat:.1f}s > "
+                        f"({age:.1f}s > "
                         f"{self.STALE_THRESHOLD}s) — evicting"
                     )
                     self.unregister_worker(wid)
@@ -278,6 +359,9 @@ class Scheduler:
         if not self.lb:
             raise RuntimeError("[Scheduler] no workers registered")
 
+        logger = get_logger()
+        logger.request_received(request.id, self.strategy)
+
         tried: set[int] = set()
         last_error: Exception | None = None
 
@@ -287,6 +371,8 @@ class Scheduler:
                 # No healthy worker remains that we haven't already tried.
                 break
             tried.add(worker.id)
+            queue_depth = worker._queue.qsize() if worker._queue is not None else 0
+            logger.dispatch(request.id, worker.id, attempt, worker.pending, queue_depth)
             print(
                 f"[Scheduler] dispatching request {request.id} -> worker {worker.id} "
                 f"(attempt {attempt}/{self.MAX_ATTEMPTS}, pending={worker.pending})"
@@ -295,17 +381,31 @@ class Scheduler:
             # LB pick in a burst sees an up-to-date load reading.
             worker.pending += 1
             try:
-                return await asyncio.wait_for(
+                result = await asyncio.wait_for(
                     worker.submit(request), timeout=self.REQUEST_TIMEOUT
                 )
+                # Phase 21: log completion
+                latency_ms = result.get("latency", 0.0) * 1000
+                logger.completed(request.id, worker.id, latency_ms, 0.0)
+                self._record_completion()
+                return result
             except asyncio.TimeoutError as e:
                 last_error = e
+                logger.timeout(request.id, worker.id, attempt, self.REQUEST_TIMEOUT)
+                self._record_timeout()
+                if attempt < self.MAX_ATTEMPTS:
+                    logger.reassign(request.id, worker.id, -1, attempt)
+                    self._record_retry()
                 print(
                     f"[Scheduler] request {request.id} TIMED OUT on worker {worker.id} "
                     f"after {self.REQUEST_TIMEOUT}s — reassigning"
                 )
             except Exception as e:
                 last_error = e
+                self._record_failure()
+                if attempt < self.MAX_ATTEMPTS:
+                    logger.reassign(request.id, worker.id, -1, attempt)
+                    self._record_retry()
                 print(
                     f"[Scheduler] request {request.id} FAILED on worker {worker.id}: "
                     f"{type(e).__name__}: {e} — reassigning"
@@ -316,6 +416,7 @@ class Scheduler:
 
         # Out of attempts (or workers). Surface the failure to the caller.
         if last_error is None:
+            self._record_overload()
             raise RuntimeError(
                 f"[Scheduler] no available workers for request {request.id}"
             )
@@ -349,62 +450,105 @@ class Scheduler:
         Step 20: each worker entry now also carries p50_latency, p95_latency,
         and throughput_rps (requests per second over the last THROUGHPUT_WINDOW
         seconds). The cluster aggregate sums per-worker throughput.
+
+        Phase 23: adds GPU simulation metrics (util %, VRAM, queue pressure, saturation).
         """
         workers = self.get_workers()
         per_worker = []
         total_processed = 0
         total_latency = 0.0
         cluster_throughput = 0.0
+        cluster_util = 0.0
+        cluster_overload_events = 0
         now = time.time()
         for w in workers:
             avg = (w.total_latency / w.processed_count) if w.processed_count else 0.0
-            p50, p95 = _percentiles([lat for _, lat in w.recent], (50, 95))
+            latency_samples = w.end_to_end if w.end_to_end else w.recent
+            p50, p95, p99 = _percentiles([lat for _, lat in latency_samples], (50, 95, 99))
+            qw_p50, qw_p95, qw_p99 = _percentiles([lat for _, lat in w.queue_wait], (50, 95, 99))
             recent_count = sum(
                 1 for ts, _ in w.recent if now - ts <= self.THROUGHPUT_WINDOW
             )
             tput = recent_count / self.THROUGHPUT_WINDOW
+
+            # Phase 23: GPU metrics snapshot
+            gpu_state = w.gpu_sim.update(
+                w.inflight, w._queue.qsize() if w._queue is not None else 0
+            )
+
             per_worker.append({
                 "worker_id": w.id,
                 "processed": w.processed_count,
                 "busy": w.busy,
                 "inflight": w.inflight,
                 "pending": w.pending,
+                "queue_depth": w._queue.qsize() if w._queue is not None else 0,
                 "avg_latency": round(avg, 4),
                 "p50_latency": round(p50, 4),
                 "p95_latency": round(p95, 4),
+                "p99_latency": round(p99, 4),
+                "queue_wait_p50": round(qw_p50, 4),
+                "queue_wait_p95": round(qw_p95, 4),
+                "queue_wait_p99": round(qw_p99, 4),
                 "throughput_rps": round(tput, 3),
                 "last_heartbeat_age_s": round(now - w.last_heartbeat, 2),
+                # Phase 23: GPU simulation metrics
+                "gpu_util_pct": gpu_state.util_pct,
+                "gpu_vram_used_mb": gpu_state.vram_used_mb,
+                "gpu_vram_total_mb": w.gpu_sim.total_vram_mb,
+                "gpu_queue_pressure": gpu_state.queue_pressure,
+                "gpu_saturation_score": gpu_state.saturation_score,
+                "gpu_overload_score": gpu_state.overload_score,
             })
             total_processed += w.processed_count
             total_latency += w.total_latency
             cluster_throughput += tput
+            cluster_util += gpu_state.util_pct
+            if gpu_state.overload_score > 0.5:
+                cluster_overload_events += 1
+
         cluster_avg = (total_latency / total_processed) if total_processed else 0.0
+        avg_util = cluster_util / max(1, len(workers))
+
+        sched_total, sched_tput, retry_count, timeout_count, failure_count, overload_events = (
+            self._scheduler_metrics_snapshot(now)
+        )
+        retry_rate = retry_count / max(1, sched_total + retry_count)
+        timeout_rate = timeout_count / max(1, sched_total + timeout_count)
         return {
             "strategy": self.strategy,
             "worker_count": len(workers),
             "total_processed": total_processed,
             "cluster_avg_latency": round(cluster_avg, 4),
             "cluster_throughput_rps": round(cluster_throughput, 3),
+            "scheduler_processed": sched_total,
+            "scheduler_throughput_rps": round(sched_tput, 3),
+            "retry_count": retry_count,
+            "timeout_count": timeout_count,
+            "failure_count": failure_count,
+            "overload_events": overload_events,
+            "retry_rate": round(retry_rate, 4),
+            "timeout_rate": round(timeout_rate, 4),
+            # Phase 23: cluster-level GPU metrics
+            "cluster_gpu_util_avg_pct": round(avg_util, 2),
+            "cluster_gpu_overload_count": cluster_overload_events,
             "workers": per_worker,
         }
 
 
 def _percentiles(values: list[float], percentiles: tuple[int, ...]) -> tuple[float, ...]:
-    """Return the requested percentile values from `values`.
+    """Compatibility shim for tests; delegates to common.metrics.percentiles()."""
+    return _calc_percentiles(values, percentiles)
 
-    Uses ceil-based nearest-rank on a sorted copy: for percentile p, the
-    chosen index is `ceil(p/100 * n)` (clamped into [0, n-1]). This biases
-    toward INCLUDING the upper tail — a single tail spike in a 20-sample
-    window is visible at p95 — which is the behavior we want for monitoring.
 
-    Returns 0.0 for each percentile when the input is empty.
-    """
-    if not values:
-        return tuple(0.0 for _ in percentiles)
-    s = sorted(values)
-    n = len(s)
-    out = []
-    for p in percentiles:
-        idx = min(n - 1, max(0, math.ceil(p / 100.0 * n)))
-        out.append(s[idx])
-    return tuple(out)
+@dataclass
+class SchedulerMetrics:
+    completed: deque[float] = field(default_factory=lambda: deque(maxlen=5000))
+    retries: int = 0
+    timeouts: int = 0
+    failures: int = 0
+    overload_events: int = 0
+
+
+    def record_completion(self, ts: float) -> None:
+        self.completed.append(ts)
