@@ -1,11 +1,19 @@
-"""GPU worker node - Phase 4 / Step 14: heartbeats.
+"""GPU worker node - Phase 4 / Steps 14 + 18.
 
 `process()` / `process_async()` are the sync / async execution surfaces.
 `_do_work` calls real LLM via `infer()` (Step 12).
-`start()` now also spawns a heartbeat task that updates `last_heartbeat`
-every HEARTBEAT_INTERVAL seconds. The Scheduler polls this timestamp
-(Step 15) to detect dead / hung workers.
+`start()` spawns a heartbeat task that updates `last_heartbeat` every
+HEARTBEAT_INTERVAL seconds. The Scheduler polls this timestamp (Step 15)
+to detect dead / hung workers.
+
+Step 18: `simulate_failure()` flips a kill switch — stops the heartbeat
+(so the scheduler's health check evicts the worker) and makes any new
+`_do_work` call raise `WorkerDeadError` (so Step 17 reassignment fires).
 """
+
+
+class WorkerDeadError(RuntimeError):
+    """Raised by a worker that has been killed via simulate_failure()."""
 
 import asyncio
 import time
@@ -29,6 +37,7 @@ class GPUWorker:
         self._queue: asyncio.Queue | None = None       # created in start()
         self._consumers: list[asyncio.Task] = []       # N drain coroutines
         self._heartbeat_task: asyncio.Task | None = None
+        self._dead = False                             # Step 18: kill switch
 
     @property
     def busy(self) -> bool:
@@ -69,7 +78,12 @@ class GPUWorker:
         context from rag/retriever.py and forwards the augmented prompt to
         Ollama on llama3.2:1b. Returns the LLM's response text directly, or
         a tagged error string if Ollama is unreachable / errors out.
+
+        Step 18: if `simulate_failure()` has been called, raise immediately
+        so the scheduler's reassignment path takes over.
         """
+        if self._dead:
+            raise WorkerDeadError(f"worker {self.id} has been killed")
         result = infer(request.query)
         if result.get("status") != "success":
             return f"[infer-error] {result.get('error', 'unknown')}: {result.get('response', '')[:200]}"
@@ -131,6 +145,28 @@ class GPUWorker:
         self._consumers = []
         self._queue = None
 
+    def simulate_failure(self) -> None:
+        """Step 18: pretend this worker just crashed.
+
+        Effects:
+          * `_dead = True` -> any new `_do_work` call raises WorkerDeadError,
+            triggering Step 17 reassignment on the scheduler side.
+          * Heartbeat task is cancelled -> after STALE_THRESHOLD seconds,
+            the scheduler's health monitor (Step 15) evicts this worker.
+          * Consumers are NOT cancelled — in-flight requests fail naturally
+            via WorkerDeadError on their next _do_work call.
+
+        Idempotent: re-calling on an already-dead worker is a no-op.
+        """
+        if self._dead:
+            return
+        self._dead = True
+        if self._heartbeat_task is not None:
+            self._heartbeat_task.cancel()
+            self._heartbeat_task = None
+        print(f"[Worker {self.id}] SIMULATED FAILURE — heartbeat stopped, "
+              f"new work will raise WorkerDeadError")
+
     async def _heartbeat_loop(self) -> None:
         """Tick `last_heartbeat` every HEARTBEAT_INTERVAL seconds until cancelled."""
         try:
@@ -160,9 +196,14 @@ class GPUWorker:
             request, future = item
             try:
                 result = await self.process_async(request)
-                future.set_result(result)
+                # Guard: the future may already be cancelled if the caller
+                # gave up on us (Step 16 wait_for timeout) — setting a result
+                # on a settled future raises InvalidStateError.
+                if not future.done():
+                    future.set_result(result)
             except Exception as e:
-                future.set_exception(e)
+                if not future.done():
+                    future.set_exception(e)
             finally:
                 self._queue.task_done()
 
