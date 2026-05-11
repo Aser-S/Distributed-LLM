@@ -18,6 +18,7 @@ class WorkerDeadError(RuntimeError):
 import asyncio
 import time
 import threading
+from collections import deque
 
 from llm.inference import infer
 
@@ -25,6 +26,7 @@ from llm.inference import infer
 class GPUWorker:
     DEFAULT_CONCURRENCY = 4
     HEARTBEAT_INTERVAL = 1.0  # seconds between heartbeat timestamp updates
+    METRICS_WINDOW = 200      # Step 20: keep last N (completed_at, latency) pairs
 
     def __init__(self, worker_id: int, concurrency: int = DEFAULT_CONCURRENCY):
         self.id = worker_id
@@ -39,6 +41,7 @@ class GPUWorker:
         self._heartbeat_task: asyncio.Task | None = None
         self._dead = False                             # Step 18: kill switch
         self.pending = 0                               # Step 19: dispatched-but-not-yet-completed
+        self.recent: deque[tuple[float, float]] = deque(maxlen=self.METRICS_WINDOW)  # Step 20
 
     @property
     def busy(self) -> bool:
@@ -99,6 +102,8 @@ class GPUWorker:
             self.inflight -= 1
             self.processed_count += 1
             self.total_latency += elapsed
+            # Step 20: append a sliding-window sample for p50/p95/throughput.
+            self.recent.append((time.time(), elapsed))
 
     def _build_response(self, request, result: str, latency: float) -> dict:
         return {
