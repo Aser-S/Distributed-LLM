@@ -1,4 +1,4 @@
-"""Master scheduler - Phase 4 (Steps 14-18) + Phase 5 Step 19.
+"""Master scheduler - Phase 4 (Steps 14-18) + Phase 5 Steps 19-21.
 
 Strategies for `get_next_worker`:
   - "round_robin"        -> lb.load_balancer.LoadBalancer (cycles workers)
@@ -18,9 +18,15 @@ Step 17: On timeout / exception, the request is reassigned to another worker
 Step 19: `worker.pending` is incremented at dispatch time and decremented on
          completion, so the balancer can distribute a burst evenly even
          before any request has reached its consumer.
+Step 20: per-worker p50/p95 latency + recent throughput, derived from the
+         sliding window `worker.recent` and surfaced via cluster_status().
+Step 21: optional dashboard loop (`start_dashboard()` / `stop_dashboard()`)
+         that prints a single rolling status line every DASHBOARD_INTERVAL
+         seconds — opt-in so existing tests/scripts stay quiet by default.
 """
 
 import asyncio
+import math
 import time
 
 from lb.load_balancer import LoadBalancer
@@ -78,6 +84,12 @@ class Scheduler:
     REQUEST_TIMEOUT = 30.0        # seconds before a single submit() is abandoned
     MAX_ATTEMPTS = 3              # total tries (1 initial + 2 reassignments)
 
+    # Metrics window (Step 20).
+    THROUGHPUT_WINDOW = 10.0      # seconds over which req/s is computed
+
+    # Dashboard (Step 21).
+    DASHBOARD_INTERVAL = 5.0      # seconds between dashboard status prints
+
     def __init__(self, workers=None, strategy: str = "round_robin"):
         if strategy not in self.SUPPORTED_STRATEGIES:
             raise ValueError(
@@ -87,6 +99,7 @@ class Scheduler:
         self.workers = {}  # worker_id -> GPUWorker
         self.lb = None
         self._health_monitor_task: asyncio.Task | None = None
+        self._dashboard_task: asyncio.Task | None = None
         if workers:
             self.register_workers(workers)
 
@@ -148,7 +161,8 @@ class Scheduler:
         self.start_health_monitor()
 
     async def stop_workers(self) -> None:
-        """Stop health monitor, then drain all worker queues."""
+        """Stop dashboard + health monitor, then drain all worker queues."""
+        await self.stop_dashboard()
         await self.stop_health_monitor()
         if not self.workers:
             return
@@ -174,6 +188,58 @@ class Scheduler:
         except asyncio.CancelledError:
             pass
         self._health_monitor_task = None
+
+    # --- Step 21: aggregate monitoring / dashboard line ---
+
+    def start_dashboard(self, interval: float | None = None) -> None:
+        """Start an opt-in background task that prints a rolling status line.
+
+        Disabled by default — call this explicitly from main / your harness
+        when you want continuous visibility into a long-running run.
+        `interval` overrides DASHBOARD_INTERVAL for this run only.
+        """
+        if self._dashboard_task is not None:
+            return
+        period = interval if interval is not None else self.DASHBOARD_INTERVAL
+        self._dashboard_task = asyncio.create_task(
+            self._dashboard_loop(period), name="scheduler-dashboard"
+        )
+
+    async def stop_dashboard(self) -> None:
+        """Cancel and await the dashboard task."""
+        if self._dashboard_task is None:
+            return
+        self._dashboard_task.cancel()
+        try:
+            await self._dashboard_task
+        except asyncio.CancelledError:
+            pass
+        self._dashboard_task = None
+
+    async def _dashboard_loop(self, interval: float) -> None:
+        """Print one summary line per `interval` seconds.
+
+        Format keeps everything on one line so a tail -f / scrolling terminal
+        stays readable. Per-worker block uses `id:processed@p95s/tput` triples.
+        """
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                status = self.cluster_status()
+                workers = "  ".join(
+                    f"w{w['worker_id']}:{w['processed']}@p95={w['p95_latency']}s/"
+                    f"{w['throughput_rps']}rps/pend={w['pending']}"
+                    for w in status["workers"]
+                )
+                print(
+                    f"[Dashboard] strategy={status['strategy']} "
+                    f"workers={status['worker_count']} "
+                    f"total={status['total_processed']} "
+                    f"avg={status['cluster_avg_latency']}s "
+                    f"tput={status['cluster_throughput_rps']}rps | {workers}"
+                )
+        except asyncio.CancelledError:
+            return
 
     async def _health_check_loop(self) -> None:
         """Periodically evict workers whose heartbeat has gone stale.
@@ -280,15 +346,23 @@ class Scheduler:
     def cluster_status(self) -> dict:
         """Snapshot of the cluster: per-worker stats + aggregates.
 
-        Used to verify load distribution and to feed monitoring in Phase 5.
+        Step 20: each worker entry now also carries p50_latency, p95_latency,
+        and throughput_rps (requests per second over the last THROUGHPUT_WINDOW
+        seconds). The cluster aggregate sums per-worker throughput.
         """
         workers = self.get_workers()
         per_worker = []
         total_processed = 0
         total_latency = 0.0
+        cluster_throughput = 0.0
         now = time.time()
         for w in workers:
             avg = (w.total_latency / w.processed_count) if w.processed_count else 0.0
+            p50, p95 = _percentiles([lat for _, lat in w.recent], (50, 95))
+            recent_count = sum(
+                1 for ts, _ in w.recent if now - ts <= self.THROUGHPUT_WINDOW
+            )
+            tput = recent_count / self.THROUGHPUT_WINDOW
             per_worker.append({
                 "worker_id": w.id,
                 "processed": w.processed_count,
@@ -296,15 +370,41 @@ class Scheduler:
                 "inflight": w.inflight,
                 "pending": w.pending,
                 "avg_latency": round(avg, 4),
+                "p50_latency": round(p50, 4),
+                "p95_latency": round(p95, 4),
+                "throughput_rps": round(tput, 3),
                 "last_heartbeat_age_s": round(now - w.last_heartbeat, 2),
             })
             total_processed += w.processed_count
             total_latency += w.total_latency
+            cluster_throughput += tput
         cluster_avg = (total_latency / total_processed) if total_processed else 0.0
         return {
             "strategy": self.strategy,
             "worker_count": len(workers),
             "total_processed": total_processed,
             "cluster_avg_latency": round(cluster_avg, 4),
+            "cluster_throughput_rps": round(cluster_throughput, 3),
             "workers": per_worker,
         }
+
+
+def _percentiles(values: list[float], percentiles: tuple[int, ...]) -> tuple[float, ...]:
+    """Return the requested percentile values from `values`.
+
+    Uses ceil-based nearest-rank on a sorted copy: for percentile p, the
+    chosen index is `ceil(p/100 * n)` (clamped into [0, n-1]). This biases
+    toward INCLUDING the upper tail — a single tail spike in a 20-sample
+    window is visible at p95 — which is the behavior we want for monitoring.
+
+    Returns 0.0 for each percentile when the input is empty.
+    """
+    if not values:
+        return tuple(0.0 for _ in percentiles)
+    s = sorted(values)
+    n = len(s)
+    out = []
+    for p in percentiles:
+        idx = min(n - 1, max(0, math.ceil(p / 100.0 * n)))
+        out.append(s[idx])
+    return tuple(out)
