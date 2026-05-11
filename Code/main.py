@@ -23,12 +23,14 @@ def main():
 
     print("\n--- CLUSTER STATUS ---")
     status = scheduler.cluster_status()
-    print(f"workers={status['worker_count']}, "
+    print(f"strategy={status['strategy']}, workers={status['worker_count']}, "
           f"total_processed={status['total_processed']}, "
-          f"cluster_avg_latency={status['cluster_avg_latency']}s")
+          f"cluster_avg_latency={status['cluster_avg_latency']}s, "
+          f"cluster_throughput={status['cluster_throughput_rps']} rps")
     for w in status["workers"]:
         print(f"  worker {w['worker_id']}: processed={w['processed']}, "
-              f"avg_latency={w['avg_latency']}s")
+              f"avg={w['avg_latency']}s, p50={w['p50_latency']}s, "
+              f"p95={w['p95_latency']}s, tput={w['throughput_rps']} rps")
 
 
 if __name__ == "__main__":
