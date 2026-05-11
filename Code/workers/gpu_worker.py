@@ -38,6 +38,7 @@ class GPUWorker:
         self._consumers: list[asyncio.Task] = []       # N drain coroutines
         self._heartbeat_task: asyncio.Task | None = None
         self._dead = False                             # Step 18: kill switch
+        self.pending = 0                               # Step 19: dispatched-but-not-yet-completed
 
     @property
     def busy(self) -> bool:
