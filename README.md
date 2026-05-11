@@ -3,7 +3,7 @@
 **CSE354 — Distributed Computing**
 Efficient load balancing and GPU cluster task distribution for handling 1000+ concurrent LLM+RAG requests.
 
-This project simulates a small GPU cluster that serves an LLM (Ollama `llama3.2:1b`) augmented with a lightweight RAG retriever. A master scheduler routes incoming requests across a pool of asynchronous GPU worker nodes, with active health checks, per-request timeouts, and automatic task reassignment on failure.
+This project runs **real Ollama inference** (model `llama3.2:1b`) with a lightweight RAG retriever, while **simulating GPU resource behavior** (utilization, VRAM pressure, saturation) to support 1000+ concurrent-user stress testing on commodity hardware. A master scheduler routes incoming requests across a pool of asynchronous GPU worker nodes, with active health checks, per-request timeouts, automatic task reassignment, and structured observability.
 
 ---
 
@@ -12,7 +12,8 @@ This project simulates a small GPU cluster that serves an LLM (Ollama `llama3.2:
 ```
                     ┌──────────────────────────────────────────┐
                     │              Client (load gen)           │
-                    │   threading.Thread per simulated user    │
+                    │   async_load_generator (asyncio)         │
+                    │   load_generator (threaded)              │
                     └────────────────────┬─────────────────────┘
                                          │ Request(id, query)
                                          ▼
@@ -20,16 +21,19 @@ This project simulates a small GPU cluster that serves an LLM (Ollama `llama3.2:
                     │                Scheduler                 │
                     │  • registry: {worker_id -> GPUWorker}    │
                     │  • strategy: round_robin | least_conn    │
+                    │             | load_aware | gpu_aware     │
                     │  • health monitor task (Step 15)         │
                     │  • per-request timeout + reassignment    │
                     │    (Steps 16-17)                         │
+                    │  • metrics + structured logging          │
                     └────────────────────┬─────────────────────┘
                                          │ via LB.get_next_worker()
                                          ▼
                 ┌────────────────────────────────────────────────┐
                 │            Load Balancer (pluggable)           │
                 │   round_robin  (lb/load_balancer.py)           │
-                │   least_connections  (master/scheduler.py)     │
+                │   least_connections | load_aware | gpu_aware   │
+                │   (master/scheduler.py)                        │
                 └────────────────────┬───────────────────────────┘
                                      │ submit(request)
               ┌──────────────────────┼──────────────────────┐
@@ -37,9 +41,10 @@ This project simulates a small GPU cluster that serves an LLM (Ollama `llama3.2:
        ┌────────────┐         ┌────────────┐         ┌────────────┐
        │ GPUWorker 0│         │ GPUWorker 1│   ...   │ GPUWorker N│
        │            │         │            │         │            │
-       │ asyncio.Q  │         │ asyncio.Q  │         │ asyncio.Q  │
-       │ N consumers│         │ N consumers│         │ N consumers│
-       │ heartbeat  │         │ heartbeat  │         │ heartbeat  │
+        │ asyncio.Q  │         │ asyncio.Q  │         │ asyncio.Q  │
+        │ N consumers│         │ N consumers│         │ N consumers│
+        │ heartbeat  │         │ heartbeat  │         │ heartbeat  │
+        │ GPU sim    │         │ GPU sim    │         │ GPU sim    │
        └─────┬──────┘         └─────┬──────┘         └─────┬──────┘
              │                      │                      │
              └──────────────────────┼──────────────────────┘
@@ -56,6 +61,7 @@ This project simulates a small GPU cluster that serves an LLM (Ollama `llama3.2:
 
 - **Three coexisting execution surfaces** on each worker — `process()` (sync), `process_async()` (async), and queue-backed `submit()` (actor-style). The first two are kept for the synchronous round-robin LB; production traffic goes through `submit()`.
 - **`_do_work()` is a seam.** Started as a `time.sleep` stub in Phase 1 and was swapped for the real `infer()` call in Phase 3 without touching the surrounding lifecycle.
+- **Hybrid realism.** The LLM and RAG are real; only GPU utilization/VRAM/queue pressure are simulated to enable large-scale stress testing without enterprise GPUs.
 - **Scheduler owns liveness, LB owns ordering.** The load balancer is a pure selector — no state about who is healthy. The scheduler evicts dead workers, and the LB sees a clean registry on rebuild.
 - **Absolute imports only**, matching `main.py`'s entry contract.
 
@@ -65,10 +71,15 @@ This project simulates a small GPU cluster that serves an LLM (Ollama `llama3.2:
 
 ```
 Code/
-├── main.py                  # entry point: 4 workers, 4-user sync smoke test
+├── main.py                  # entry point: sync | async | hardening modes
 ├── client/
-│   └── load_generator.py    # threaded load generator (coworker-owned)
+│   ├── async_load_generator.py  # asyncio load/stress generator
+│   └── load_generator.py        # threaded load generator (coworker-owned)
 ├── common/
+│   ├── metrics.py           # rolling windows + p50/p95/p99
+│   ├── gpu_sim.py           # GPU util/VRAM/saturation simulation
+│   ├── structured_logging.py# JSON event logging
+│   ├── hardening.py         # shutdown/recovery validation suite
 │   └── models.py            # Request / Response dataclasses (coworker-owned)
 ├── lb/
 │   └── load_balancer.py     # round-robin LB (coworker-owned)
@@ -82,7 +93,9 @@ Code/
 │   └── gpu_worker.py        # ★ GPUWorker — owned by this work
 ├── test_step15.py           # health-check eviction
 ├── test_step16_17.py        # per-task timeout + reassignment
-└── test_step18.py           # simulate_failure end-to-end
+├── test_step18.py           # simulate_failure end-to-end
+├── test_step19.py           # load-aware burst distribution
+└── test_step20.py           # latency percentiles + throughput math
 ```
 
 ★ = files this project owns. All other modules are coworker-owned and treated as stable contracts.
@@ -112,9 +125,11 @@ Code/
 |  | 17 | Task reassignment on timeout / exception | ✅ |
 |  | 18 | Failure simulation (`simulate_failure()`) | ✅ |
 | **5 — Optimization** | 19 | Load-aware scheduling (`pending` counter) | ✅ |
-|  | 20 | Per-worker p50/p95 latency + throughput | ✅ |
-|  | 21 | Aggregate monitoring / dashboard line | ☐ |
-|  | 22 | Stress test (1000 concurrent users) | ☐ |
+| **6 — Metrics & Observability** | 20 | p50/p95/p99 latency + throughput | ✅ |
+|  | 21 | Structured observability (JSON logs + snapshots) | ✅ |
+|  | 22 | Async stress tests (100/500/1000 users) | ✅ |
+| **7 — GPU Simulation & Hardening** | 23 | GPU util/VRAM simulation + gpu_aware routing | ✅ |
+|  | 24 | Hardening suite (shutdown/recovery/consistency) | ✅ |
 
 ---
 
@@ -125,7 +140,7 @@ Code/
 ```python
 Scheduler(workers: list[GPUWorker] | None = None,
           strategy: str = "round_robin")
-# strategies: "round_robin" | "least_connections" | "load_aware"
+# strategies: "round_robin" | "least_connections" | "load_aware" | "gpu_aware"
 
 # Registry
 .register_worker(w) / .register_workers(ws) / .unregister_worker(id)
@@ -142,7 +157,7 @@ async .handle_request_async(request) -> dict
 async .stop_workers()         # graceful drain + cancel monitors
 
 # Observability
-.cluster_status() -> dict     # per-worker stats + heartbeat ages
+.cluster_status() -> dict     # per-worker stats + heartbeat ages + GPU/queue metrics
 
 # Tunables (class attributes)
 HEALTH_CHECK_INTERVAL = 2.0   # health sweep period (s)
@@ -193,12 +208,14 @@ async .stop()      # sentinel-drains the queue, cancels heartbeat
   curl http://localhost:11434/api/tags    # sanity check
   ```
 
-### End-to-end demo
+### End-to-end demo (sync baseline)
 
 ```powershell
 cd Code
-python main.py
+python main.py --mode sync
 ```
+
+`python main.py` also works (defaults to sync mode).
 
 Expected output (per-request latency depends on your CPU/GPU):
 
@@ -214,6 +231,27 @@ workers=4, total_processed=4, cluster_avg_latency=2.71s
   worker 1: processed=1, avg_latency=2.56s
   worker 2: processed=1, avg_latency=2.79s
   worker 3: processed=1, avg_latency=2.99s
+```
+
+### Async stress testing (100/500/1000 users)
+
+```powershell
+cd Code
+python main.py --mode async
+```
+
+To run a full benchmark sweep:
+
+```python
+from client.async_load_generator import run_scalability_benchmark
+# benchmark = await run_scalability_benchmark(scheduler, [100, 500, 1000], duration_s=30)
+```
+
+### Hardening suite (shutdown/recovery/consistency)
+
+```powershell
+cd Code
+python main.py --mode hardening
 ```
 
 ### Fault-tolerance test suite
@@ -253,14 +291,13 @@ Each should print `[test] PASS` lines and exit cleanly.
 
 ---
 
-## Scaling toward Phase 5
+## Advanced phases (20–24) implemented
 
-The Phase 4 work was deliberately built with Phase 5 in mind. Hooks already in place:
-
-- **Per-worker metrics** (`processed_count`, `total_latency`, `inflight`, `pending`, `recent`, `last_heartbeat`) — `cluster_status()` aggregates them; Step 20 derives p50/p95 latency and recent-window throughput from `worker.recent`. Step 21 will roll these into an aggregate dashboard line.
-- **Bounded concurrency per worker** (`concurrency=4` by default) — caps in-flight Ollama calls so 1000 incoming users do not saturate the local GPU.
-- **Pluggable strategy** (`SUPPORTED_STRATEGIES`) — adding a new balancer is one new class + one new branch in `_rebuild_lb`. No call-site changes. Step 19's `LoadAwareBalancer` followed this pattern.
-- **Failure injection** (`simulate_failure()`) — Step 22's stress test can scripted-kill workers mid-flight to measure tail-latency under failure.
+- **Metrics**: per-worker p50/p95/p99 + throughput, scheduler retry/timeout/overload rates.
+- **Observability**: JSON structured logging + periodic cluster snapshots.
+- **Stress testing**: async load generator with 100/500/1000-user benchmarks.
+- **GPU simulation**: util/VRAM/saturation/overload scoring + gpu_aware routing.
+- **Hardening**: graceful shutdown, recovery validation, consistency checks.
 
 ### Resolved: least-connections burst bias
 
