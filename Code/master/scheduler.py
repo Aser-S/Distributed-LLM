@@ -1,8 +1,9 @@
-"""Master scheduler - Phase 4 / Steps 14-17.
+"""Master scheduler - Phase 4 (Steps 14-18) + Phase 5 Step 19.
 
 Strategies for `get_next_worker`:
   - "round_robin"        -> lb.load_balancer.LoadBalancer (cycles workers)
-  - "least_connections"  -> LeastConnectionsBalancer below (picks lowest inflight)
+  - "least_connections"  -> LeastConnectionsBalancer (picks lowest inflight)
+  - "load_aware"         -> LoadAwareBalancer (picks lowest pending; Step 19)
 
 Execution surfaces:
   - handle_request(request)        -> sync, calls worker.process(request)
@@ -14,6 +15,9 @@ Step 15: `_health_check_loop()` evicts workers whose heartbeat goes stale.
 Step 16: `handle_request_async` wraps submit() in asyncio.wait_for(timeout).
 Step 17: On timeout / exception, the request is reassigned to another worker
          up to MAX_ATTEMPTS times. The failing worker is skipped on retry.
+Step 19: `worker.pending` is incremented at dispatch time and decremented on
+         completion, so the balancer can distribute a burst evenly even
+         before any request has reached its consumer.
 """
 
 import asyncio
@@ -40,10 +44,31 @@ class LeastConnectionsBalancer:
         return self.get_next_worker().process(request)
 
 
+class LoadAwareBalancer:
+    """Step 19: picks the worker with the lowest `pending` count.
+
+    `pending` is incremented by the scheduler the moment a worker is chosen
+    (NOT when the request actually starts executing on a consumer), so a
+    burst of N async requests gets distributed across all workers instead of
+    piling onto worker 0 like least-connections did.
+
+    Ties are broken by id for determinism.
+    """
+
+    def __init__(self, workers: list[GPUWorker]):
+        self.workers = workers
+
+    def get_next_worker(self) -> GPUWorker:
+        return min(self.workers, key=lambda w: (w.pending, w.id))
+
+    def dispatch(self, request):
+        return self.get_next_worker().process(request)
+
+
 class Scheduler:
     """Master controller. Source of truth for the cluster; dispatches via LB."""
 
-    SUPPORTED_STRATEGIES = ("round_robin", "least_connections")
+    SUPPORTED_STRATEGIES = ("round_robin", "least_connections", "load_aware")
 
     # Health-check tuning knobs.
     HEALTH_CHECK_INTERVAL = 2.0   # seconds between health sweeps
@@ -98,6 +123,8 @@ class Scheduler:
             self.lb = LoadBalancer(workers)
         elif self.strategy == "least_connections":
             self.lb = LeastConnectionsBalancer(workers)
+        elif self.strategy == "load_aware":
+            self.lb = LoadAwareBalancer(workers)
         else:
             raise ValueError(f"unknown strategy {self.strategy!r}")
 
@@ -196,8 +223,11 @@ class Scheduler:
             tried.add(worker.id)
             print(
                 f"[Scheduler] dispatching request {request.id} -> worker {worker.id} "
-                f"(attempt {attempt}/{self.MAX_ATTEMPTS})"
+                f"(attempt {attempt}/{self.MAX_ATTEMPTS}, pending={worker.pending})"
             )
+            # Step 19: account for this dispatch BEFORE awaiting so the next
+            # LB pick in a burst sees an up-to-date load reading.
+            worker.pending += 1
             try:
                 return await asyncio.wait_for(
                     worker.submit(request), timeout=self.REQUEST_TIMEOUT
@@ -214,6 +244,9 @@ class Scheduler:
                     f"[Scheduler] request {request.id} FAILED on worker {worker.id}: "
                     f"{type(e).__name__}: {e} — reassigning"
                 )
+            finally:
+                # Always release the slot regardless of outcome.
+                worker.pending = max(0, worker.pending - 1)
 
         # Out of attempts (or workers). Surface the failure to the caller.
         if last_error is None:
@@ -260,6 +293,8 @@ class Scheduler:
                 "worker_id": w.id,
                 "processed": w.processed_count,
                 "busy": w.busy,
+                "inflight": w.inflight,
+                "pending": w.pending,
                 "avg_latency": round(avg, 4),
                 "last_heartbeat_age_s": round(now - w.last_heartbeat, 2),
             })
