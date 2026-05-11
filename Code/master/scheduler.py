@@ -1,4 +1,4 @@
-"""Master scheduler - Phase 4 / Step 15: scheduler-side health checks.
+"""Master scheduler - Phase 4 / Steps 14-17.
 
 Strategies for `get_next_worker`:
   - "round_robin"        -> lb.load_balancer.LoadBalancer (cycles workers)
@@ -7,10 +7,13 @@ Strategies for `get_next_worker`:
 Execution surfaces:
   - handle_request(request)        -> sync, calls worker.process(request)
   - handle_request_async(request)  -> async, calls await worker.submit(request)
+                                      with per-task timeout + reassignment
 
-Step 14: `cluster_status()` now reports `last_heartbeat_age_s` per worker.
-Step 15: `_health_check_loop()` runs every HEALTH_CHECK_INTERVAL seconds and
-         evicts any worker whose heartbeat age exceeds STALE_THRESHOLD.
+Step 14: `cluster_status()` reports `last_heartbeat_age_s` per worker.
+Step 15: `_health_check_loop()` evicts workers whose heartbeat goes stale.
+Step 16: `handle_request_async` wraps submit() in asyncio.wait_for(timeout).
+Step 17: On timeout / exception, the request is reassigned to another worker
+         up to MAX_ATTEMPTS times. The failing worker is skipped on retry.
 """
 
 import asyncio
@@ -45,6 +48,10 @@ class Scheduler:
     # Health-check tuning knobs.
     HEALTH_CHECK_INTERVAL = 2.0   # seconds between health sweeps
     STALE_THRESHOLD = 3.0         # seconds of silence before a worker is evicted
+
+    # Per-request tuning knobs (Steps 16-17).
+    REQUEST_TIMEOUT = 30.0        # seconds before a single submit() is abandoned
+    MAX_ATTEMPTS = 3              # total tries (1 initial + 2 reassignments)
 
     def __init__(self, workers=None, strategy: str = "round_robin"):
         if strategy not in self.SUPPORTED_STRATEGIES:
@@ -167,16 +174,75 @@ class Scheduler:
             return
 
     async def handle_request_async(self, request) -> dict:
-        """Async dispatch: LB picks the worker, the worker's queue runs the request.
+        """Async dispatch with per-task timeout (Step 16) + reassignment (Step 17).
 
-        The LB's selection logic (RR or least-connections) is reused unchanged;
-        only the execution surface differs (await submit vs sync process).
+        Picks a worker via the LB, awaits `worker.submit(request)` with a
+        REQUEST_TIMEOUT bound. On timeout or any exception the worker is
+        added to a skip-set and another worker is chosen, up to MAX_ATTEMPTS.
+        If every attempt fails, the last exception is re-raised so the caller
+        sees the actual failure mode.
         """
         if not self.lb:
             raise RuntimeError("[Scheduler] no workers registered")
-        worker = self.lb.get_next_worker()
-        print(f"[Scheduler] dispatching request {request.id} -> worker {worker.id} (async)")
-        return await worker.submit(request)
+
+        tried: set[int] = set()
+        last_error: Exception | None = None
+
+        for attempt in range(1, self.MAX_ATTEMPTS + 1):
+            worker = self._pick_worker(skip=tried)
+            if worker is None:
+                # No healthy worker remains that we haven't already tried.
+                break
+            tried.add(worker.id)
+            print(
+                f"[Scheduler] dispatching request {request.id} -> worker {worker.id} "
+                f"(attempt {attempt}/{self.MAX_ATTEMPTS})"
+            )
+            try:
+                return await asyncio.wait_for(
+                    worker.submit(request), timeout=self.REQUEST_TIMEOUT
+                )
+            except asyncio.TimeoutError as e:
+                last_error = e
+                print(
+                    f"[Scheduler] request {request.id} TIMED OUT on worker {worker.id} "
+                    f"after {self.REQUEST_TIMEOUT}s — reassigning"
+                )
+            except Exception as e:
+                last_error = e
+                print(
+                    f"[Scheduler] request {request.id} FAILED on worker {worker.id}: "
+                    f"{type(e).__name__}: {e} — reassigning"
+                )
+
+        # Out of attempts (or workers). Surface the failure to the caller.
+        if last_error is None:
+            raise RuntimeError(
+                f"[Scheduler] no available workers for request {request.id}"
+            )
+        raise RuntimeError(
+            f"[Scheduler] request {request.id} failed after {len(tried)} attempt(s); "
+            f"last error: {type(last_error).__name__}: {last_error}"
+        ) from last_error
+
+    def _pick_worker(self, skip: set[int]):
+        """Pick a registered worker not in `skip`, preferring the LB's choice.
+
+        Uses the LB's get_next_worker() first (so RR rotation / least-conn
+        logic is preserved); if that worker is in `skip`, scans the rest.
+        Returns None if every registered worker has been tried.
+        """
+        if not self.lb:
+            return None
+        # Fast path: LB's first pick is fine if it hasn't been tried.
+        primary = self.lb.get_next_worker()
+        if primary.id not in skip:
+            return primary
+        # Fallback: linear scan of the registry for any untried worker.
+        for w in self.workers.values():
+            if w.id not in skip:
+                return w
+        return None
 
     def cluster_status(self) -> dict:
         """Snapshot of the cluster: per-worker stats + aggregates.
