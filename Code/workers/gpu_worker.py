@@ -1,10 +1,10 @@
-"""GPU worker node - Phase 3 / Step 12: real LLM pipeline in `_do_work`.
+"""GPU worker node - Phase 4 / Step 14: heartbeats.
 
-`process()` is the sync lifecycle (used by round-robin LB).
-`process_async()` adds an async surface that offloads `_do_work` to a thread.
-`_do_work` calls `llm.inference.infer(query)`, which internally retrieves RAG
-context and forwards the full prompt to Ollama. The TA's "use AI model, no
-simulation" requirement is satisfied here.
+`process()` / `process_async()` are the sync / async execution surfaces.
+`_do_work` calls real LLM via `infer()` (Step 12).
+`start()` now also spawns a heartbeat task that updates `last_heartbeat`
+every HEARTBEAT_INTERVAL seconds. The Scheduler polls this timestamp
+(Step 15) to detect dead / hung workers.
 """
 
 import asyncio
@@ -16,6 +16,7 @@ from llm.inference import infer
 
 class GPUWorker:
     DEFAULT_CONCURRENCY = 4
+    HEARTBEAT_INTERVAL = 1.0  # seconds between heartbeat timestamp updates
 
     def __init__(self, worker_id: int, concurrency: int = DEFAULT_CONCURRENCY):
         self.id = worker_id
@@ -23,9 +24,11 @@ class GPUWorker:
         self.inflight = 0                              # number of requests currently being processed
         self.processed_count = 0
         self.total_latency = 0.0
+        self.last_heartbeat = time.time()              # updated by _heartbeat_loop; read by Scheduler health checks
         self._lock = threading.Lock()
         self._queue: asyncio.Queue | None = None       # created in start()
         self._consumers: list[asyncio.Task] = []       # N drain coroutines
+        self._heartbeat_task: asyncio.Task | None = None
 
     @property
     def busy(self) -> bool:
@@ -93,7 +96,7 @@ class GPUWorker:
     # --- Step 8: per-worker async queue ---
 
     def start(self) -> None:
-        """Spawn `concurrency` consumer coroutines sharing one queue.
+        """Spawn the consumer pool + the heartbeat task.
 
         Must be called from inside a running event loop.
         """
@@ -104,16 +107,38 @@ class GPUWorker:
             asyncio.create_task(self._consumer(), name=f"worker-{self.id}-c{i}")
             for i in range(self.concurrency)
         ]
+        self.last_heartbeat = time.time()
+        self._heartbeat_task = asyncio.create_task(
+            self._heartbeat_loop(), name=f"worker-{self.id}-hb"
+        )
 
     async def stop(self) -> None:
-        """Send one shutdown sentinel per consumer and wait for all to exit."""
+        """Cancel heartbeat, send shutdown sentinels, wait for consumers to exit."""
         if not self._consumers or self._queue is None:
             return
+        # Stop heartbeat first so it doesn't tick during shutdown.
+        if self._heartbeat_task:
+            self._heartbeat_task.cancel()
+            try:
+                await self._heartbeat_task
+            except asyncio.CancelledError:
+                pass
+            self._heartbeat_task = None
+        # Drain consumers.
         for _ in self._consumers:
             await self._queue.put(None)
         await asyncio.gather(*self._consumers)
         self._consumers = []
         self._queue = None
+
+    async def _heartbeat_loop(self) -> None:
+        """Tick `last_heartbeat` every HEARTBEAT_INTERVAL seconds until cancelled."""
+        try:
+            while True:
+                await asyncio.sleep(self.HEARTBEAT_INTERVAL)
+                self.last_heartbeat = time.time()
+        except asyncio.CancelledError:
+            return
 
     async def submit(self, request) -> dict:
         """Enqueue a request and await its response."""
