@@ -202,11 +202,14 @@ async .stop()      # sentinel-drains the queue, cancels heartbeat
 
 - Python 3.12
 - `requests` (`pip install requests`)
+- `chromadb` (`pip install chromadb`)
 - [Ollama](https://ollama.com) running locally with `llama3.2:1b` pulled:
   ```powershell
   ollama pull llama3.2:1b
+  ollama pull nomic-embed-text   # embeddings model for RAG
   curl http://localhost:11434/api/tags    # sanity check
   ```
+  If you use a different embeddings model, set `OLLAMA_EMBED_MODEL`.
 
 ### End-to-end demo (sync baseline)
 
