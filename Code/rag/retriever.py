@@ -107,7 +107,7 @@ def _ollama_embed(texts: list[str]) -> list[Embedding]:
         embedding = data.get("embedding")
         if not isinstance(embedding, list):
             raise ValueError("invalid embedding response from Ollama")
-        embeddings.append(tuple(float(x) for x in embedding))
+        embeddings.append([float(x) for x in embedding])
     return embeddings
 
 

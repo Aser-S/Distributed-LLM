@@ -91,11 +91,11 @@ Code/
 │   └── scheduler.py         # ★ Scheduler — owned by this work
 ├── workers/
 │   └── gpu_worker.py        # ★ GPUWorker — owned by this work
-├── test_step15.py           # health-check eviction
-├── test_step16_17.py        # per-task timeout + reassignment
-├── test_step18.py           # simulate_failure end-to-end
-├── test_step19.py           # load-aware burst distribution
-└── test_step20.py           # latency percentiles + throughput math
+├── test_phase15.py          # health-check eviction
+├── test_phase16_17.py       # per-task timeout + reassignment
+├── test_phase18.py          # simulate_failure end-to-end
+├── test_phase19.py          # load-aware burst distribution
+└── test_phase20.py          # latency percentiles + throughput math
 ```
 
 ★ = files this project owns. All other modules are coworker-owned and treated as stable contracts.
@@ -262,11 +262,11 @@ python main.py --mode hardening
 These tests don't touch Ollama — they stub `_do_work` so they finish in seconds:
 
 ```powershell
-python test_step15.py         # health-check eviction
-python test_step16_17.py      # timeout + reassignment
-python test_step18.py         # simulate_failure end-to-end
-python test_step19.py         # load-aware burst distribution
-python test_step20.py         # p50/p95 + throughput math
+python test_phase15.py        # health-check eviction
+python test_phase16_17.py     # timeout + reassignment
+python test_phase18.py        # simulate_failure end-to-end
+python test_phase19.py        # load-aware burst distribution
+python test_phase20.py        # p50/p95 + throughput math
 ```
 
 Each should print `[test] PASS` lines and exit cleanly.
@@ -304,7 +304,7 @@ Each should print `[test] PASS` lines and exit cleanly.
 
 ### Resolved: least-connections burst bias
 
-Step 19 closed this. The scheduler now increments `worker.pending` the moment a worker is chosen — before `submit()` is awaited — so a burst of N async requests gets distributed evenly across workers instead of all landing on worker 0. See [test_step19.py](Code/test_step19.py) for a before/after comparison between strategies.
+Step 19 closed this. The scheduler now increments `worker.pending` the moment a worker is chosen — before `submit()` is awaited — so a burst of N async requests gets distributed evenly across workers instead of all landing on worker 0. See [test_phase19.py](Code/test_phase19.py) for a before/after comparison between strategies.
 
 ---
 
