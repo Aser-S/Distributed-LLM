@@ -14,6 +14,7 @@ from __future__ import annotations
 import os
 import re
 import threading
+from typing import Sequence
 from pathlib import Path
 
 import requests
@@ -67,6 +68,7 @@ _KNOWLEDGE_BASE: list[str] = [
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 _collection_lock = threading.Lock()
 _collection = None
+Embedding = Sequence[float]
 
 
 def _tokenize(text: str) -> set[str]:
@@ -94,9 +96,9 @@ def _keyword_retrieve(query: str, top_k: int) -> str:
     return " ".join(doc for _, doc in scored[:top_k])
 
 
-def _ollama_embed(texts: list[str]) -> list[list[float]]:
+def _ollama_embed(texts: list[str]) -> list[Embedding]:
     """Embed a list of texts using Ollama's /api/embeddings endpoint."""
-    embeddings: list[list[float]] = []
+    embeddings: list[Embedding] = []
     for text in texts:
         payload = {"model": OLLAMA_EMBED_MODEL, "prompt": text}
         resp = requests.post(f"{OLLAMA_BASE_URL}/api/embeddings", json=payload, timeout=60)
@@ -105,7 +107,7 @@ def _ollama_embed(texts: list[str]) -> list[list[float]]:
         embedding = data.get("embedding")
         if not isinstance(embedding, list):
             raise ValueError("invalid embedding response from Ollama")
-        embeddings.append(embedding)
+        embeddings.append(tuple(float(x) for x in embedding))
     return embeddings
 
 
