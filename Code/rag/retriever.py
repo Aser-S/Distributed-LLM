@@ -1,23 +1,36 @@
-"""RAG retriever - simple keyword-overlap retrieval over an in-memory KB.
-
-NOTE TO TEAMMATES:
-    This file was restored after rag/retriever.py was accidentally overwritten
-    with the inference engine code. The implementation below is intentionally
-    minimal (no new dependencies) but does *real* retrieval, not a hardcoded
-    stub. Replace `_KNOWLEDGE_BASE` and `_score` with your intended vector-DB
-    backend (FAISS / Chroma / Qdrant / etc.) when ready - the public contract
-    `retrieve_context(query: str) -> str` must stay the same so
-    `llm/inference.py` keeps working.
+"""RAG retriever backed by ChromaDB + Ollama embeddings.
 
 Public API (consumed by llm/inference.py):
     retrieve_context(query: str, top_k: int = 2) -> str
-        Returns the top-k most relevant documents from the knowledge base,
-        joined into a single context string. Empty string if nothing matches.
+
+This keeps the original contract while swapping the in-memory keyword
+retrieval for a real vector DB. If ChromaDB is not installed or Ollama
+embeddings are unavailable, it falls back to the keyword retriever with
+an explicit warning.
 """
 
 from __future__ import annotations
 
+import os
 import re
+import threading
+from pathlib import Path
+
+import requests
+
+
+# Ollama config (embeddings)
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+OLLAMA_EMBED_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text")
+
+# Chroma config (persistent local store)
+CHROMA_COLLECTION = "rag_kb"
+CHROMA_PERSIST_DIR = Path(
+    os.getenv(
+        "CHROMA_PERSIST_DIR",
+        Path(__file__).resolve().parents[1] / "data" / "chroma",
+    )
+)
 
 
 # Tiny in-memory knowledge base. Each entry is one document. Replace with a
@@ -52,6 +65,8 @@ _KNOWLEDGE_BASE: list[str] = [
 
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
+_collection_lock = threading.Lock()
+_collection = None
 
 
 def _tokenize(text: str) -> set[str]:
@@ -60,35 +75,96 @@ def _tokenize(text: str) -> set[str]:
 
 
 def _score(query_tokens: set[str], doc_tokens: set[str]) -> int:
-    """Number of shared tokens between query and document.
-
-    A simple Jaccard-numerator-style score is enough for a coursework demo;
-    swap this for cosine similarity over embeddings when wiring a real vector
-    store.
-    """
+    """Number of shared tokens between query and document."""
     return len(query_tokens & doc_tokens)
 
 
-def retrieve_context(query: str, top_k: int = 2) -> str:
-    """Return the top-k most relevant documents, joined as a single string.
-
-    Empty query or no token overlap returns "" - the LLM can still answer
-    without context in that case.
-    """
-    if not query or not query.strip():
-        return ""
+def _keyword_retrieve(query: str, top_k: int) -> str:
     q_tokens = _tokenize(query)
     if not q_tokens:
         return ""
-
     scored: list[tuple[int, str]] = []
     for doc in _KNOWLEDGE_BASE:
         s = _score(q_tokens, _tokenize(doc))
         if s > 0:
             scored.append((s, doc))
-
     if not scored:
         return ""
-
     scored.sort(key=lambda pair: pair[0], reverse=True)
     return " ".join(doc for _, doc in scored[:top_k])
+
+
+def _ollama_embed(texts: list[str]) -> list[list[float]]:
+    """Embed a list of texts using Ollama's /api/embeddings endpoint."""
+    embeddings: list[list[float]] = []
+    for text in texts:
+        payload = {"model": OLLAMA_EMBED_MODEL, "prompt": text}
+        resp = requests.post(f"{OLLAMA_BASE_URL}/api/embeddings", json=payload, timeout=60)
+        resp.raise_for_status()
+        data = resp.json()
+        embedding = data.get("embedding")
+        if not isinstance(embedding, list):
+            raise ValueError("invalid embedding response from Ollama")
+        embeddings.append(embedding)
+    return embeddings
+
+
+def _get_collection():
+    """Get or initialize the Chroma collection, seeding docs on first use."""
+    global _collection
+    if _collection is not None:
+        return _collection
+    with _collection_lock:
+        if _collection is not None:
+            return _collection
+        try:
+            import chromadb  # type: ignore
+        except ImportError:
+            print("[RAG] chromadb not installed; falling back to keyword retrieval.")
+            return None
+
+        CHROMA_PERSIST_DIR.mkdir(parents=True, exist_ok=True)
+        client = chromadb.PersistentClient(path=str(CHROMA_PERSIST_DIR))
+        collection = client.get_or_create_collection(name=CHROMA_COLLECTION)
+        if collection.count() == 0:
+            try:
+                embeddings = _ollama_embed(_KNOWLEDGE_BASE)
+            except requests.exceptions.RequestException as exc:
+                print(f"[RAG] Ollama embeddings failed ({exc}); falling back to keyword retrieval.")
+                return None
+            collection.add(
+                ids=[f"doc-{i}" for i in range(len(_KNOWLEDGE_BASE))],
+                documents=_KNOWLEDGE_BASE,
+                embeddings=embeddings,
+            )
+        _collection = collection
+        return _collection
+
+
+def retrieve_context(query: str, top_k: int = 2) -> str:
+    """Return the top-k most relevant documents, joined as a single string."""
+    if not query or not query.strip():
+        return ""
+    top_k = max(1, int(top_k))
+
+    collection = _get_collection()
+    if collection is None:
+        return _keyword_retrieve(query, top_k)
+
+    try:
+        query_embedding = _ollama_embed([query])[0]
+    except requests.exceptions.RequestException as exc:
+        print(f"[RAG] Ollama embeddings failed ({exc}); falling back to keyword retrieval.")
+        return _keyword_retrieve(query, top_k)
+
+    results = collection.query(query_embeddings=[query_embedding], n_results=top_k)
+    if not isinstance(results, dict):
+        return ""
+    documents = results.get("documents")
+    if not documents or not isinstance(documents, list):
+        return ""
+    first = documents[0] if documents else []
+    if not isinstance(first, list):
+        return ""
+    docs = [d for d in first if isinstance(d, str)]
+    return " ".join(docs) if docs else ""
