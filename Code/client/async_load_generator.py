@@ -189,14 +189,14 @@ async def run_scalability_benchmark(scheduler, concurrency_levels: list[int] | N
     Prints a summary table comparing throughput, latency, and success rates.
     """
     if concurrency_levels is None:
-        concurrency_levels = [100, 500, 1000]
+        concurrency_levels = [1000]
 
     print("\n=== SCALABILITY BENCHMARK ===")
     print(f"{'Users':<10} {'Pattern':<12} {'Throughput':<12} {'Avg Latency':<12} {'P99 Latency':<12} {'Success%':<10}")
     print("-" * 80)
 
     for num_users in concurrency_levels:
-        for pattern in ["sustained", "burst"]:
+        for pattern in ["sustained"]:
             summary = await run_async_load_test(
                 scheduler,
                 num_users=num_users,
