@@ -421,9 +421,9 @@ asyncio.run(benchmark())
 |--------|---------------|
 | **Omar ALashker** | Master Scheduler, GPU Workers, Fault Tolerance, System Integration |
 | **Aser Sherif** | Project Coordination, RAG and LLM Integration |
-| **Yassin** | Load Balancer, Client Components |
-| **Xiad** | Client Load Generation |
-| **Baydar-Man** | RAG Implementation, LLM Integration |
+| **Muhammed Yassin** | Load Balancer, Client Components |
+| **Ziad Tamer** | Client Load Generation |
+| **Mohamed Beder** | RAG Implementation, LLM Integration |
 
 ---
 
